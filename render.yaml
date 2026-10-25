@@ -1,0 +1,22 @@
+# ==============================================================================
+# HimShiksha Python Conversion API - Render Blueprint (render.yaml)
+# Deploy as a Free Tier Web Service on Render (https://render.com)
+# ==============================================================================
+
+services:
+  - type: web
+    name: himshiksha-api
+    env: python
+    region: oregon # or frankfurt / singapore
+    plan: free
+    branch: main
+    rootDir: render-api
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: HIMSHIKSHA_API_KEY
+        generateValue: false # Set in Render Dashboard or use shared secret
