@@ -133,6 +133,8 @@ async def convert_txt_to_pdf(
     font_path = os.path.join(base_dir, "..", "assets", "fonts", "NotoSansCombined-Regular.ttf")
     if not os.path.exists(font_path):
         font_path = os.path.join(base_dir, "fonts", "NotoSansCombined-Regular.ttf")
+    if not os.path.exists(font_path):
+        font_path = os.path.join(base_dir, "NotoSansCombined-Regular.ttf")
     
     font_bytes = None
     if os.path.exists(font_path):
