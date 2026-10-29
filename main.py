@@ -12,6 +12,7 @@ import time
 import zipfile
 import tempfile
 import re
+import urllib.parse
 from typing import List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, status, BackgroundTasks
@@ -69,6 +70,21 @@ def sanitize_filename(filename: str, fallback: str = "document") -> str:
     clean = re.sub(r'[^\w\.\-\s]', '_', clean)
     clean = re.sub(r'\s+', ' ', clean)
     return clean[:100] if clean else fallback
+
+def make_content_disposition(filename: str) -> str:
+    """
+    Generate an RFC 6266 / RFC 5987 compliant Content-Disposition header.
+    Guarantees 100% latin-1 / ASCII safe headers so Starlette/FastAPI never throws
+    UnicodeEncodeError on Hindi/Unicode filenames (e.g. Devanagari characters),
+    while preserving the full Unicode filename for modern browsers via filename*=UTF-8''.
+    """
+    clean_name = os.path.basename(filename.strip())
+    base, ext = os.path.splitext(clean_name)
+    ascii_base = re.sub(r'[^a-zA-Z0-9_\-]', '_', base).strip('_') or "document"
+    ascii_fallback = f"{ascii_base}{ext}"
+    # RFC 5987 percent-encoded UTF-8 filename
+    utf8_encoded = urllib.parse.quote(clean_name, encoding="utf-8")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{utf8_encoded}'
 
 # ------------------------------------------------------------------------------
 # 1. Health & Telemetry Endpoints (Free-tier Cold Start Monitoring)
@@ -226,7 +242,7 @@ async def convert_txt_to_pdf(
     return StreamingResponse(
         pdf_buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base_name}.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base_name}.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -334,7 +350,7 @@ async def merge_pdfs(
         output_buffer,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": 'attachment; filename="himshiksha_merged.pdf"',
+            "Content-Disposition": make_content_disposition("himshiksha_merged.pdf"),
             "X-Page-Count": str(total_pages)
         }
     )
@@ -399,7 +415,7 @@ async def images_to_pdf(
         output_buffer,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": 'attachment; filename="himshiksha_images_combined.pdf"',
+            "Content-Disposition": make_content_disposition("himshiksha_images_combined.pdf"),
             "X-Page-Count": str(page_count)
         }
     )
@@ -446,7 +462,7 @@ async def pdf_to_images(
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{base_name}_pages.zip"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base_name}_pages.zip")}
     )
 
 # ------------------------------------------------------------------------------
@@ -498,7 +514,7 @@ async def convert_image_format(
     return StreamingResponse(
         out_buffer,
         media_type=out_mime,
-        headers={"Content-Disposition": f'attachment; filename="{base_name}.{target}"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base_name}.{target}")}
     )
 
 # ------------------------------------------------------------------------------
@@ -554,7 +570,7 @@ async def batch_images(
         zip_buffer,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="himshiksha_batch_{target}.zip"',
+            "Content-Disposition": make_content_disposition(f"himshiksha_batch_{target}.zip"),
             "X-Batch-Summary": f"Total: {len(files)}, Succeeded: {sum(1 for r in results if r['status'] == 'PASS')}"
         }
     )
@@ -604,7 +620,7 @@ async def split_pdf(
         return StreamingResponse(
             zip_buf,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="himshiksha_split_pages.zip"'}
+            headers={"Content-Disposition": make_content_disposition("himshiksha_split_pages.zip")}
         )
 
     # Otherwise extract specified page range into a single combined output PDF
@@ -641,7 +657,7 @@ async def split_pdf(
         out_buf,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{base}_extracted.pdf"',
+            "Content-Disposition": make_content_disposition(f"{base}_extracted.pdf"),
             "X-Page-Count": str(len(selected_indices))
         }
     )
@@ -683,7 +699,7 @@ async def protect_pdf(
     return StreamingResponse(
         out_buf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}_protected.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}_protected.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -720,7 +736,7 @@ async def unlock_pdf(
     return StreamingResponse(
         out_buf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}_unlocked.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}_unlocked.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -754,7 +770,7 @@ async def rotate_pdf(
     return StreamingResponse(
         out_buf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}_rotated.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}_rotated.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -799,7 +815,7 @@ async def watermark_pdf(
     return StreamingResponse(
         out_buf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}_watermarked.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}_watermarked.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -841,7 +857,7 @@ async def page_number_pdf(
     return StreamingResponse(
         out_buf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}_numbered.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}_numbered.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -904,7 +920,7 @@ async def compress_image(
         final_buf,
         media_type="image/jpeg",
         headers={
-            "Content-Disposition": f'attachment; filename="{base}_compressed_{target_kb}kb.jpg"',
+            "Content-Disposition": make_content_disposition(f"{base}_compressed_{target_kb}kb.jpg"),
             "X-Target-KB": str(target_kb),
             "X-Output-Bytes": str(len(final_buf.getvalue()))
         }
@@ -932,7 +948,7 @@ async def convert_docx_to_pdf(
     return StreamingResponse(
         io.BytesIO(out_pdf),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -957,7 +973,7 @@ async def convert_docx_to_txt(
     return StreamingResponse(
         io.BytesIO(text_content.encode("utf-8")),
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{base}.txt"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}.txt")}
     )
 
 # ------------------------------------------------------------------------------
@@ -982,7 +998,7 @@ async def convert_xlsx_to_pdf(
     return StreamingResponse(
         io.BytesIO(out_pdf),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}.pdf")}
     )
 
 # ------------------------------------------------------------------------------
@@ -1010,7 +1026,7 @@ async def convert_xlsx_to_csv(
     return StreamingResponse(
         io.BytesIO(output_bytes),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{base}.csv"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}.csv")}
     )
 
 # ------------------------------------------------------------------------------
@@ -1036,7 +1052,7 @@ async def convert_csv_to_xlsx(
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{base}.xlsx"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}.xlsx")}
     )
 
 # ------------------------------------------------------------------------------
@@ -1063,7 +1079,7 @@ async def compress_pdf_endpoint(
         io.BytesIO(compressed_bytes),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{base}_compressed.pdf"',
+            "Content-Disposition": make_content_disposition(f"{base}_compressed.pdf"),
             "X-Original-Bytes": str(stats["original_bytes"]),
             "X-Compressed-Bytes": str(stats["compressed_bytes"]),
             "X-Savings-Percent": str(stats["savings_percent"]),
@@ -1132,7 +1148,7 @@ async def image_editor_endpoint(
         io.BytesIO(out_bytes),
         media_type=mime,
         headers={
-            "Content-Disposition": f'attachment; filename="{base}_edited.{ext}"',
+            "Content-Disposition": make_content_disposition(f"{base}_edited.{ext}"),
             "X-New-Width": str(meta["new_width"]),
             "X-New-Height": str(meta["new_height"]),
             "X-New-Bytes": str(meta["new_bytes"]),
@@ -1174,7 +1190,7 @@ async def pdf_page_editor_endpoint(
     return StreamingResponse(
         io.BytesIO(edited_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{base}_edited.pdf"'}
+        headers={"Content-Disposition": make_content_disposition(f"{base}_edited.pdf")}
     )
 
 if __name__ == "__main__":
