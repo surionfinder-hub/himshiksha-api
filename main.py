@@ -22,6 +22,11 @@ import pymupdf  # PyMuPDF
 import pypdf
 from PIL import Image
 
+from office_engine import office_engine
+from compress_engine import compress_engine
+from image_engine import image_engine
+from pdf_editor_engine import pdf_editor_engine
+
 # ------------------------------------------------------------------------------
 # Configuration & Security Constants
 # ------------------------------------------------------------------------------
@@ -552,6 +557,624 @@ async def batch_images(
             "Content-Disposition": f'attachment; filename="himshiksha_batch_{target}.zip"',
             "X-Batch-Summary": f"Total: {len(files)}, Succeeded: {sum(1 for r in results if r['status'] == 'PASS')}"
         }
+    )
+
+# ------------------------------------------------------------------------------
+# 9. PDF Split and Page Extraction
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-split")
+async def split_pdf(
+    file: UploadFile = File(...),
+    pages: Optional[str] = Form(None),
+    ranges: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="PDF exceeds 10 MB limit.")
+
+    try:
+        src_doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to open PDF: {str(e)}")
+
+    total_pages = len(src_doc)
+    if total_pages == 0:
+        src_doc.close()
+        raise HTTPException(status_code=400, detail="PDF document has 0 pages.")
+
+    page_query = ranges or pages or ("all" if mode == "all" else "all")
+
+    # If "all", extract each page into individual PDFs inside a ZIP archive
+    if page_query.strip().lower() in ["all", "zip", "*"] or mode == "all":
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p_idx in range(total_pages):
+                single_doc = pymupdf.open()
+                single_doc.insert_pdf(src_doc, from_page=p_idx, to_page=p_idx)
+                out_p = io.BytesIO()
+                single_doc.save(out_p)
+                single_doc.close()
+                base = sanitize_filename(os.path.splitext(file.filename)[0])
+                zf.writestr(f"{base}_page_{p_idx + 1}.pdf", out_p.getvalue())
+        src_doc.close()
+        zip_buf.seek(0)
+        return StreamingResponse(
+            zip_buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="himshiksha_split_pages.zip"'}
+        )
+
+    # Otherwise extract specified page range into a single combined output PDF
+    selected_indices = []
+    for part in [p.strip() for p in page_query.split(",") if p.strip()]:
+        if "-" in part:
+            s_str, e_str = part.split("-", 1)
+            s = max(1, int(s_str))
+            e = min(total_pages, int(e_str))
+            for i in range(s, e + 1):
+                if (i - 1) not in selected_indices:
+                    selected_indices.append(i - 1)
+        else:
+            p = int(part)
+            if 1 <= p <= total_pages and (p - 1) not in selected_indices:
+                selected_indices.append(p - 1)
+
+    if not selected_indices:
+        src_doc.close()
+        raise HTTPException(status_code=400, detail=f"No valid pages found in range '{pages}'. Document has {total_pages} pages.")
+
+    out_doc = pymupdf.open()
+    for idx in selected_indices:
+        out_doc.insert_pdf(src_doc, from_page=idx, to_page=idx)
+
+    src_doc.close()
+    out_buf = io.BytesIO()
+    out_doc.save(out_buf)
+    out_doc.close()
+    out_buf.seek(0)
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        out_buf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base}_extracted.pdf"',
+            "X-Page-Count": str(len(selected_indices))
+        }
+    )
+
+# ------------------------------------------------------------------------------
+# 10. PDF Password Protect / Encryption (AES-256)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-protect")
+async def protect_pdf(
+    file: UploadFile = File(...),
+    password: str = Form(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    pw = password.strip()
+    if not pw:
+        raise HTTPException(status_code=400, detail="Password cannot be empty.")
+
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {str(e)}")
+
+    out_buf = io.BytesIO()
+    doc.save(
+        out_buf,
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        user_pw=pw,
+        owner_pw=pw
+    )
+    doc.close()
+    out_buf.seek(0)
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        out_buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}_protected.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 11. PDF Password Unlock / Decryption
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-unlock")
+async def unlock_pdf(
+    file: UploadFile = File(...),
+    password: str = Form(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {str(e)}")
+
+    if doc.is_encrypted:
+        rc = doc.authenticate(password)
+        if rc <= 0:
+            doc.close()
+            raise HTTPException(status_code=400, detail="Incorrect password. Decryption failed.")
+
+    out_buf = io.BytesIO()
+    doc.save(out_buf, encryption=pymupdf.PDF_ENCRYPT_NONE)
+    doc.close()
+    out_buf.seek(0)
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        out_buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}_unlocked.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 12. PDF Page Rotation (90, 180, 270 Degrees)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-rotate")
+async def rotate_pdf(
+    file: UploadFile = File(...),
+    angle: int = Form(90),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    if angle not in [90, 180, 270, -90]:
+        raise HTTPException(status_code=400, detail="Rotation angle must be 90, 180, or 270 degrees.")
+
+    data = await file.read()
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {str(e)}")
+
+    for page in doc:
+        page.set_rotation((page.rotation + angle) % 360)
+
+    out_buf = io.BytesIO()
+    doc.save(out_buf)
+    doc.close()
+    out_buf.seek(0)
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        out_buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}_rotated.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 13. PDF Watermark Stamper
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-watermark")
+async def watermark_pdf(
+    file: UploadFile = File(...),
+    text: str = Form("CONFIDENTIAL"),
+    font_size: int = Form(36),
+    color: str = Form("red"),
+    opacity: float = Form(0.35),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {str(e)}")
+
+    color_tuple = (0.85, 0.15, 0.15) if color == "red" else ((0.1, 0.1, 0.1) if color == "black" else (0.3, 0.3, 0.8))
+
+    for page in doc:
+        rect = page.rect
+        center_pt = pymupdf.Point(rect.width * 0.15, rect.height * 0.5)
+        page.insert_text(
+            center_pt,
+            text,
+            fontsize=font_size,
+            color=color_tuple,
+            morph=(center_pt, pymupdf.Matrix(-45)),
+            overlay=True
+        )
+
+    out_buf = io.BytesIO()
+    doc.save(out_buf)
+    doc.close()
+    out_buf.seek(0)
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        out_buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}_watermarked.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 14. PDF Page Numbering Header / Footer
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-page-number")
+async def page_number_pdf(
+    file: UploadFile = File(...),
+    position: str = Form("bottom-center"),
+    start_number: int = Form(1),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PDF: {str(e)}")
+
+    total = len(doc)
+    for idx, page in enumerate(doc):
+        cur = start_number + idx
+        num_str = f"Page {cur} of {total}"
+        rect = page.rect
+        if position == "bottom-right":
+            pt = pymupdf.Point(rect.width - 110, rect.height - 25)
+        elif position == "top-right":
+            pt = pymupdf.Point(rect.width - 110, 35)
+        else: # bottom-center
+            pt = pymupdf.Point(rect.width / 2 - 40, rect.height - 25)
+        page.insert_text(pt, num_str, fontsize=10, color=(0.25, 0.25, 0.25), overlay=True)
+
+    out_buf = io.BytesIO()
+    doc.save(out_buf)
+    doc.close()
+    out_buf.seek(0)
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        out_buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}_numbered.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 15. Exam & Portal Image KB Compressor
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/image-compress")
+async def compress_image(
+    file: UploadFile = File(...),
+    target_kb: int = Form(100),
+    max_dimension: Optional[int] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    target_bytes = max(5 * 1024, target_kb * 1024)
+
+    try:
+        img = Image.open(io.BytesIO(data))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    if max_dimension and (img.width > max_dimension or img.height > max_dimension):
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+
+    best_buf = None
+    low = 10
+    high = 95
+    for _ in range(7):
+        mid = (low + high) // 2
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=mid, optimize=True)
+        if len(buf.getvalue()) <= target_bytes:
+            best_buf = buf
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    if best_buf is None:
+        # Scale dimensions down if high initial resolution
+        curr = img
+        scale = 0.8
+        while scale >= 0.25:
+            nw = max(100, int(curr.width * scale))
+            nh = max(100, int(curr.height * scale))
+            scaled = curr.resize((nw, nh), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            scaled.save(buf, format="JPEG", quality=45, optimize=True)
+            if len(buf.getvalue()) <= target_bytes:
+                best_buf = buf
+                break
+            scale -= 0.15
+
+    final_buf = best_buf or buf
+    final_buf.seek(0)
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        final_buf,
+        media_type="image/jpeg",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base}_compressed_{target_kb}kb.jpg"',
+            "X-Target-KB": str(target_kb),
+            "X-Output-Bytes": str(len(final_buf.getvalue()))
+        }
+    )
+
+# ------------------------------------------------------------------------------
+# 16. Office File Converters: DOCX -> PDF
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/docx-to-pdf")
+async def convert_docx_to_pdf(
+    file: UploadFile = File(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        out_pdf = office_engine.docx_to_pdf(data, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"DOCX to PDF conversion failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(out_pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 17. Office File Converters: DOCX -> TXT
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/docx-to-txt")
+async def convert_docx_to_txt(
+    file: UploadFile = File(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        text_content = office_engine.docx_to_txt(data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"DOCX text extraction failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(text_content.encode("utf-8")),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{base}.txt"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 18. Office File Converters: XLSX / XLS -> PDF
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/xlsx-to-pdf")
+async def convert_xlsx_to_pdf(
+    file: UploadFile = File(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        out_pdf = office_engine.xlsx_to_pdf(data, file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Spreadsheet to PDF conversion failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(out_pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}.pdf"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 19. Office File Converters: XLSX / XLS -> CSV
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/xlsx-to-csv")
+async def convert_xlsx_to_csv(
+    file: UploadFile = File(...),
+    sheet_name: Optional[str] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        csv_str = office_engine.xlsx_to_csv(data, sheet_name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Spreadsheet to CSV conversion failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    # Include UTF-8 BOM so Excel opens Hindi & Unicode text properly
+    output_bytes = b"\xef\xbb\xbf" + csv_str.encode("utf-8")
+    return StreamingResponse(
+        io.BytesIO(output_bytes),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{base}.csv"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 20. Office File Converters: CSV -> XLSX
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/csv-to-xlsx")
+async def convert_csv_to_xlsx(
+    file: UploadFile = File(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        text = data.decode("utf-8-sig", errors="replace")
+        xlsx_bytes = office_engine.csv_to_xlsx(text, os.path.splitext(file.filename)[0])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV to XLSX conversion failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{base}.xlsx"'}
+    )
+
+# ------------------------------------------------------------------------------
+# 21. Advanced PDF Compressor (Presets: Screen, Ebook, Printer)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-compress")
+async def compress_pdf_endpoint(
+    file: UploadFile = File(...),
+    preset: str = Form("balanced"),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    try:
+        compressed_bytes, stats = compress_engine.compress_pdf(data, preset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF compression failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(compressed_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base}_compressed.pdf"',
+            "X-Original-Bytes": str(stats["original_bytes"]),
+            "X-Compressed-Bytes": str(stats["compressed_bytes"]),
+            "X-Savings-Percent": str(stats["savings_percent"]),
+            "X-Is-Reduced": "true" if stats["is_reduced"] else "false",
+            "X-Engine": stats["engine"],
+            "Access-Control-Expose-Headers": "X-Original-Bytes, X-Compressed-Bytes, X-Savings-Percent, X-Is-Reduced, X-Engine"
+        }
+    )
+
+# ------------------------------------------------------------------------------
+# 22. Image Editor Workspace (Crop, Resize, Rotate, Flip, Quality, Format)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/image-editor")
+async def image_editor_endpoint(
+    file: UploadFile = File(...),
+    crop_x: Optional[int] = Form(None),
+    crop_y: Optional[int] = Form(None),
+    crop_w: Optional[int] = Form(None),
+    crop_h: Optional[int] = Form(None),
+    resize_w: Optional[int] = Form(None),
+    resize_h: Optional[int] = Form(None),
+    target_width: Optional[int] = Form(None),
+    target_height: Optional[int] = Form(None),
+    rotate_deg: float = Form(0.0),
+    rotate_angle: float = Form(0.0),
+    flip_h: bool = Form(False),
+    flip_v: bool = Form(False),
+    quality: int = Form(90),
+    format: str = Form("jpeg"),
+    output_format: Optional[str] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    data = await file.read()
+    if len(data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
+    crop_box = None
+    if crop_x is not None and crop_y is not None and crop_w is not None and crop_h is not None:
+        crop_box = (crop_x, crop_y, crop_w, crop_h)
+
+    fin_w = resize_w if resize_w is not None else target_width
+    fin_h = resize_h if resize_h is not None else target_height
+    resize_dims = (fin_w, fin_h) if (fin_w is not None and fin_h is not None) else None
+
+    fin_rot = rotate_deg if rotate_deg != 0.0 else rotate_angle
+    fin_fmt = output_format or format
+
+    try:
+        out_bytes, mime, meta = image_engine.edit_image(
+            data,
+            crop_box=crop_box,
+            resize_dims=resize_dims,
+            rotate_angle=fin_rot,
+            flip_h=flip_h,
+            flip_v=flip_v,
+            quality=quality,
+            target_format=fin_fmt
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image editing failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    ext = meta["format"]
+    return StreamingResponse(
+        io.BytesIO(out_bytes),
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'attachment; filename="{base}_edited.{ext}"',
+            "X-New-Width": str(meta["new_width"]),
+            "X-New-Height": str(meta["new_height"]),
+            "X-New-Bytes": str(meta["new_bytes"]),
+            "Access-Control-Expose-Headers": "X-New-Width, X-New-Height, X-New-Bytes"
+        }
+    )
+
+# ------------------------------------------------------------------------------
+# 23. PDF Page Editor Backend (Reorder, Rotate, Delete, Merge, Validate)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-page-editor")
+async def pdf_page_editor_endpoint(
+    file: UploadFile = File(...),
+    operations: str = Form("[]"),
+    pages_json: Optional[str] = Form(None),
+    additional_files: Optional[List[UploadFile]] = File(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    primary_data = await file.read()
+    if len(primary_data) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="Primary PDF exceeds 10 MB limit.")
+
+    extra_bytes = []
+    if additional_files:
+        for extra in additional_files:
+            b = await extra.read()
+            if b:
+                extra_bytes.append(b)
+
+    ops_payload = pages_json if (pages_json and pages_json != "[]") else operations
+
+    try:
+        edited_bytes = pdf_editor_engine.edit_pages(primary_data, ops_payload, extra_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF page modification failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(edited_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{base}_edited.pdf"'}
     )
 
 if __name__ == "__main__":
