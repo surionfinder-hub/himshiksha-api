@@ -28,6 +28,15 @@ from compress_engine import compress_engine
 from image_engine import image_engine
 from pdf_editor_engine import pdf_editor_engine
 
+# Modular Media Engines (Audio, Video, Probing, Limits, Cleanup)
+from media_probe import get_media_info, MediaProbeError
+from media_validation import validate_file_signature, sanitize_filename as sanitize_media_filename, MediaValidationError
+from media_limits import check_size_limit, check_disk_space, calculate_timeout, MediaLimitExceededError, MediaResourceError, CATEGORY_LIMITS
+from media_cleanup import spool_upload_to_disk, safe_remove, sweep_stale_temp_files
+from audio_converter import convert_audio, AudioConversionError, AUDIO_CODEC_MAP
+from video_converter import convert_video, VideoConversionError, VIDEO_TARGET_SPECS
+import media_jobs
+
 # ------------------------------------------------------------------------------
 # Configuration & Security Constants
 # ------------------------------------------------------------------------------
@@ -1192,6 +1201,283 @@ async def pdf_page_editor_endpoint(
         media_type="application/pdf",
         headers={"Content-Disposition": make_content_disposition(f"{base}_edited.pdf")}
     )
+
+# ------------------------------------------------------------------------------
+# 24. Media Configuration & Dynamic Limits Endpoint
+# ------------------------------------------------------------------------------
+@app.get("/api/media/limits")
+async def get_media_limits_endpoint():
+    return {
+        "status": "active",
+        "limits": {
+            "images_max_bytes": CATEGORY_LIMITS["images"],
+            "images_max_mb": CATEGORY_LIMITS["images"] // (1024 * 1024),
+            "pdf_docs_max_bytes": CATEGORY_LIMITS["pdf_docs"],
+            "pdf_docs_max_mb": CATEGORY_LIMITS["pdf_docs"] // (1024 * 1024),
+            "office_max_bytes": CATEGORY_LIMITS["office"],
+            "office_max_mb": CATEGORY_LIMITS["office"] // (1024 * 1024),
+            "audio_max_bytes": CATEGORY_LIMITS["audio"],
+            "audio_max_mb": CATEGORY_LIMITS["audio"] // (1024 * 1024),
+            "video_max_bytes": CATEGORY_LIMITS["video"],
+            "video_max_mb": CATEGORY_LIMITS["video"] // (1024 * 1024)
+        },
+        "supported_audio_formats": list(AUDIO_CODEC_MAP.keys()),
+        "supported_video_formats": list(VIDEO_TARGET_SPECS.keys())
+    }
+
+# ------------------------------------------------------------------------------
+# 25. Media Probing Endpoint (FFprobe Metadata Extraction)
+# ------------------------------------------------------------------------------
+@app.post("/api/media/probe")
+async def probe_media_endpoint(
+    file: UploadFile = File(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    spooled_path = await spool_upload_to_disk(file, suffix="_probe.tmp")
+    try:
+        info = get_media_info(spooled_path)
+        return {"success": True, "info": info}
+    except MediaProbeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        safe_remove(spooled_path)
+
+# ------------------------------------------------------------------------------
+# Helper for Streaming File Output Directly from Disk (Chunked 64KB)
+# ------------------------------------------------------------------------------
+def stream_file_and_cleanup(file_path: str):
+    try:
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+    finally:
+        safe_remove(file_path)
+
+# ------------------------------------------------------------------------------
+# 26. Unified Audio Converter Endpoint
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/audio")
+async def convert_audio_endpoint(
+    file: UploadFile = File(...),
+    target_format: str = Form("mp3"),
+    bitrate: Optional[str] = Form(None),
+    sample_rate: Optional[int] = Form(None),
+    channels: Optional[int] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+
+    spooled_path = await spool_upload_to_disk(file, suffix=f"_{file.filename}")
+    try:
+        file_size = os.path.getsize(spooled_path)
+        check_size_limit("audio", file_size)
+        check_disk_space(file_size * 2)
+
+        result = convert_audio(
+            input_path=spooled_path,
+            output_format=target_format,
+            bitrate=bitrate,
+            sample_rate=sample_rate,
+            channels=channels
+        )
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=413, detail=str(e))
+    except AudioConversionError as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=500, detail=f"Unexpected audio conversion error: {str(e)}")
+    finally:
+        safe_remove(spooled_path)
+
+    out_path = result["output_path"]
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    out_filename = f"{base}.{result['extension']}"
+
+    return StreamingResponse(
+        stream_file_and_cleanup(out_path),
+        media_type=result["mime_type"],
+        headers={
+            "Content-Disposition": make_content_disposition(out_filename),
+            "X-Format": result["format"],
+            "X-Output-Bytes": str(result["size_bytes"]),
+            "Access-Control-Expose-Headers": "X-Format, X-Output-Bytes"
+        }
+    )
+
+# ------------------------------------------------------------------------------
+# 27. Unified Video Converter Endpoint (Synchronous & Asynchronous)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/video")
+async def convert_video_endpoint(
+    file: UploadFile = File(...),
+    target_format: str = Form("mp4"),
+    resolution: Optional[str] = Form(None),
+    preset: str = Form("fast"),
+    crf: int = Form(23),
+    async_mode: bool = Form(False),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+
+    spooled_path = await spool_upload_to_disk(file, suffix=f"_{file.filename}")
+    try:
+        file_size = os.path.getsize(spooled_path)
+        check_size_limit("video", file_size)
+        check_disk_space(file_size * 2)
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=413, detail=str(e))
+
+    # Automatic switch to background job if file > 25MB or client explicitly requested async_mode
+    if async_mode or file_size > (25 * 1024 * 1024):
+        job_id = media_jobs.create_job(
+            media_type="video",
+            input_path=spooled_path,
+            output_format=target_format,
+            original_filename=file.filename,
+            options={
+                "resolution": resolution,
+                "preset": preset,
+                "crf": crf
+            }
+        )
+        return {
+            "success": True,
+            "async": True,
+            "job_id": job_id,
+            "status": "processing",
+            "message": "Video conversion is processing in background. Poll /api/media/jobs/{job_id} for status.",
+            "status_url": f"/api/media/jobs/{job_id}",
+            "download_url": f"/api/media/jobs/{job_id}/download"
+        }
+
+    # Synchronous processing for smaller videos
+    try:
+        result = convert_video(
+            input_path=spooled_path,
+            output_format=target_format,
+            resolution=resolution,
+            preset=preset,
+            crf=crf
+        )
+    except VideoConversionError as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=500, detail=f"Unexpected video conversion error: {str(e)}")
+    finally:
+        safe_remove(spooled_path)
+
+    out_path = result["output_path"]
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    out_filename = f"{base}.{result['extension']}"
+
+    return StreamingResponse(
+        stream_file_and_cleanup(out_path),
+        media_type=result["mime_type"],
+        headers={
+            "Content-Disposition": make_content_disposition(out_filename),
+            "X-Format": result["format"],
+            "X-Output-Bytes": str(result["size_bytes"]),
+            "X-Mode": result["conversion_mode"],
+            "Access-Control-Expose-Headers": "X-Format, X-Output-Bytes, X-Mode"
+        }
+    )
+
+# ------------------------------------------------------------------------------
+# 28. Media Job Status & Download Endpoints
+# ------------------------------------------------------------------------------
+@app.get("/api/media/jobs/{job_id}")
+async def get_media_job_status(job_id: str, x_himshiksha_key: Optional[str] = Header(None)):
+    verify_api_key(x_himshiksha_key)
+    job = media_jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    return {"success": True, "job": job}
+
+@app.get("/api/media/jobs/{job_id}/download")
+async def download_media_job_output(job_id: str, x_himshiksha_key: Optional[str] = Header(None)):
+    verify_api_key(x_himshiksha_key)
+    out_path = media_jobs.get_job_output_path(job_id)
+    if not out_path or not os.path.exists(out_path):
+        raise HTTPException(status_code=404, detail="Output file not ready or job expired.")
+
+    job = media_jobs.get_job(job_id) or {}
+    orig_name = job.get("original_filename", "media_output")
+    fmt = job.get("output_format", "bin")
+    base = sanitize_filename(os.path.splitext(orig_name)[0])
+    out_filename = f"{base}.{fmt}"
+
+    # Determine mime type
+    mime = "application/octet-stream"
+    if fmt in AUDIO_CODEC_MAP:
+        mime = AUDIO_CODEC_MAP[fmt]["mime"]
+    elif fmt in VIDEO_TARGET_SPECS:
+        mime = VIDEO_TARGET_SPECS[fmt]["mime"]
+
+    return StreamingResponse(
+        stream_file_and_cleanup(out_path),
+        media_type=mime,
+        headers={"Content-Disposition": make_content_disposition(out_filename)}
+    )
+
+# ------------------------------------------------------------------------------
+# 29. Dedicated Tool Conversion Route Aliases
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/audio-to-mp3")
+async def convert_audio_to_mp3(file: UploadFile = File(...), bitrate: Optional[str] = Form(None), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format="mp3", bitrate=bitrate, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/audio-to-wav")
+async def convert_audio_to_wav(file: UploadFile = File(...), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format="wav", x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/audio-to-aac")
+async def convert_audio_to_aac(file: UploadFile = File(...), bitrate: Optional[str] = Form(None), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format="aac", bitrate=bitrate, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/audio-to-flac")
+async def convert_audio_to_flac(file: UploadFile = File(...), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format="flac", x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/audio-to-ogg")
+async def convert_audio_to_ogg(file: UploadFile = File(...), bitrate: Optional[str] = Form(None), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format="ogg", bitrate=bitrate, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/audio-to-m4a")
+async def convert_audio_to_m4a(file: UploadFile = File(...), bitrate: Optional[str] = Form(None), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format="m4a", bitrate=bitrate, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/video-to-mp4")
+async def convert_video_to_mp4(file: UploadFile = File(...), resolution: Optional[str] = Form(None), async_mode: bool = Form(False), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_video_endpoint(file=file, target_format="mp4", resolution=resolution, async_mode=async_mode, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/video-to-webm")
+async def convert_video_to_webm(file: UploadFile = File(...), resolution: Optional[str] = Form(None), async_mode: bool = Form(False), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_video_endpoint(file=file, target_format="webm", resolution=resolution, async_mode=async_mode, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/video-to-mkv")
+async def convert_video_to_mkv(file: UploadFile = File(...), resolution: Optional[str] = Form(None), async_mode: bool = Form(False), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_video_endpoint(file=file, target_format="mkv", resolution=resolution, async_mode=async_mode, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/video-to-avi")
+async def convert_video_to_avi(file: UploadFile = File(...), resolution: Optional[str] = Form(None), async_mode: bool = Form(False), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_video_endpoint(file=file, target_format="avi", resolution=resolution, async_mode=async_mode, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/video-to-mov")
+async def convert_video_to_mov(file: UploadFile = File(...), resolution: Optional[str] = Form(None), async_mode: bool = Form(False), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_video_endpoint(file=file, target_format="mov", resolution=resolution, async_mode=async_mode, x_himshiksha_key=x_himshiksha_key)
+
+@app.post("/api/convert/video-extract-audio")
+async def convert_video_extract_audio(file: UploadFile = File(...), target_format: str = Form("mp3"), bitrate: Optional[str] = Form("192k"), x_himshiksha_key: Optional[str] = Header(None)):
+    return await convert_audio_endpoint(file=file, target_format=target_format, bitrate=bitrate, x_himshiksha_key=x_himshiksha_key)
+
+
 
 if __name__ == "__main__":
     import uvicorn
