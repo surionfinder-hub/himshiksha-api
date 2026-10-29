@@ -14,13 +14,13 @@ CATEGORY_LIMITS = {
     "pdf_docs": 20 * 1024 * 1024,      # 20 MB
     "office": 20 * 1024 * 1024,        # 20 MB
     "audio": 50 * 1024 * 1024,         # 50 MB
-    "video": 500 * 1024 * 1024,       # 500 MB
+    "video": 800 * 1024 * 1024,        # 800 MB
 }
 
 # Video Specific Processing Safety Bounds
 MAX_VIDEO_DURATION_SECONDS = 7200      # 2 hours max video length
 MAX_CONCURRENT_VIDEO_JOBS = 2          # Throttle concurrent video encoding to protect Render RAM/CPU
-MIN_DISK_FREE_BUFFER_BYTES = 500 * 1024 * 1024  # Require at least 500MB free disk space
+MIN_DISK_FREE_BUFFER_BYTES = 200 * 1024 * 1024  # Require at least 200MB free disk space
 
 # Global concurrency semaphore for heavy video conversions
 _video_semaphore = threading.Semaphore(MAX_CONCURRENT_VIDEO_JOBS)
