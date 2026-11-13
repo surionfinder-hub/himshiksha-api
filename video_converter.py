@@ -183,9 +183,17 @@ def convert_video(
 
         # Apply resolution filter if specified
         if resolution:
-            # Validate resolution format e.g. 1280x720 or 720p
-            if "x" in resolution:
-                w, h = resolution.split("x", 1)
+            res_clean = resolution.lower().strip()
+            if res_clean == "1080p":
+                cmd.extend(["-vf", "scale=-2:1080"])
+            elif res_clean == "720p":
+                cmd.extend(["-vf", "scale=-2:720"])
+            elif res_clean == "480p":
+                cmd.extend(["-vf", "scale=-2:480"])
+            elif res_clean == "360p":
+                cmd.extend(["-vf", "scale=-2:360"])
+            elif "x" in res_clean:
+                w, h = res_clean.split("x", 1)
                 if w.isdigit() and h.isdigit():
                     cmd.extend(["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"])
 
