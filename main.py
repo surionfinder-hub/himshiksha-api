@@ -1529,3 +1529,46 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
+from print_studio_engine import PrintStudioServerEngine
+
+@app.post("/api/convert/print-studio")
+async def print_studio_endpoint(
+    file: UploadFile = File(...),
+    paper_size: str = Form("a4"),
+    orientation: str = Form("portrait"),
+    nup: int = Form(1),
+    booklet: bool = Form(False),
+    booklet_binding: str = Form("left"),
+    duplex_mode: str = Form("simplex"),
+    duplex_part: str = Form("all"),
+    color_mode: str = Form("color"),
+    watermark_text: Optional[str] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="PDF exceeds file size limit.")
+
+    try:
+        out_bytes = PrintStudioServerEngine.process_print_job(
+            input_pdf_bytes=pdf_bytes,
+            paper_size=paper_size,
+            orientation=orientation,
+            nup=nup,
+            booklet=booklet,
+            booklet_binding=booklet_binding,
+            duplex_mode=duplex_mode,
+            duplex_part=duplex_part,
+            color_mode=color_mode,
+            watermark_text=watermark_text
+        )
+        return StreamingResponse(
+            io.BytesIO(out_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": 'attachment; filename="print_studio_output.pdf"'}
+        )
+    except Exception as e:
+        logger.error(f"Print Studio processing error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
