@@ -27,6 +27,7 @@ from office_engine import office_engine
 from compress_engine import compress_engine
 from image_engine import image_engine
 from pdf_editor_engine import pdf_editor_engine
+from pdf_color_engine import pdf_color_engine
 
 # Modular Media Engines (Audio, Video, Probing, Limits, Cleanup)
 from media_probe import get_media_info, MediaProbeError
@@ -1200,6 +1201,51 @@ async def pdf_page_editor_endpoint(
         io.BytesIO(edited_bytes),
         media_type="application/pdf",
         headers={"Content-Disposition": make_content_disposition(f"{base}_edited.pdf")}
+    )
+
+# ------------------------------------------------------------------------------
+# 24. PDF Color Effects Backend (Invert, Warm, Classic Blue, Green, Original)
+# ------------------------------------------------------------------------------
+@app.post("/api/convert/pdf-color-effects")
+async def pdf_color_effects_endpoint(
+    file: UploadFile = File(...),
+    preset: str = Form("invert"),
+    intensity: float = Form(1.0),
+    target_dpi: int = Form(150),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="PDF exceeds limit.")
+
+    preset_clean = (preset or "invert").lower().strip()
+    valid_presets = (
+        "invert", "negative", "grayscale", "black-white", "bw", "warm", "warm-tone",
+        "cool", "cool-tone", "classic-blue", "blue", "green", "green-tone", "natural-green",
+        "sepia", "high-contrast", "contrast", "original", "none"
+    )
+    if preset_clean not in valid_presets:
+        preset_clean = "invert"
+
+    try:
+        filtered_bytes = pdf_color_engine.transform_pdf(
+            pdf_bytes,
+            preset=preset_clean,
+            intensity=intensity,
+            target_dpi=target_dpi
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF color effect processing failed: {str(e)}")
+
+    base = sanitize_filename(os.path.splitext(file.filename)[0])
+    return StreamingResponse(
+        io.BytesIO(filtered_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": make_content_disposition(f"{base}_{preset_clean}.pdf"),
+            "X-Preset-Applied": preset_clean
+        }
     )
 
 # ------------------------------------------------------------------------------
