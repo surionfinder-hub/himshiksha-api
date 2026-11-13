@@ -1075,14 +1075,25 @@ async def compress_pdf_endpoint(
     x_himshiksha_key: Optional[str] = Header(None)
 ):
     verify_api_key(x_himshiksha_key)
-    data = await file.read()
-    if len(data) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
-
+    # Stream/spool to disk without application fixed limit to support large files
+    spooled_path = await spool_upload_to_disk(file, suffix="_compress.pdf")
     try:
+        file_size = os.path.getsize(spooled_path)
+        check_disk_space(file_size * 2)
+
+        # Process from disk / file bytes safely
+        with open(spooled_path, "rb") as f:
+            data = f.read()
+
         compressed_bytes, stats = compress_engine.compress_pdf(data, preset)
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:
+        safe_remove(spooled_path)
         raise HTTPException(status_code=400, detail=f"PDF compression failed: {str(e)}")
+    finally:
+        safe_remove(spooled_path)
 
     base = sanitize_filename(os.path.splitext(file.filename)[0])
     return StreamingResponse(
@@ -1178,23 +1189,38 @@ async def pdf_page_editor_endpoint(
     x_himshiksha_key: Optional[str] = Header(None)
 ):
     verify_api_key(x_himshiksha_key)
-    primary_data = await file.read()
-    if len(primary_data) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="Primary PDF exceeds 10 MB limit.")
-
-    extra_bytes = []
-    if additional_files:
-        for extra in additional_files:
-            b = await extra.read()
-            if b:
-                extra_bytes.append(b)
-
-    ops_payload = pages_json if (pages_json and pages_json != "[]") else operations
+    # Stream upload to disk to support large multi-hundred MB PDFs without fixed limit
+    spooled_path = await spool_upload_to_disk(file, suffix="_editor_primary.pdf")
+    extra_paths = []
 
     try:
+        file_size = os.path.getsize(spooled_path)
+        check_disk_space(file_size * 2)
+
+        with open(spooled_path, "rb") as f:
+            primary_data = f.read()
+
+        extra_bytes = []
+        if additional_files:
+            for extra in additional_files:
+                epath = await spool_upload_to_disk(extra, suffix="_editor_extra.pdf")
+                extra_paths.append(epath)
+                with open(epath, "rb") as ef:
+                    extra_bytes.append(ef.read())
+
+        ops_payload = pages_json if (pages_json and pages_json != "[]") else operations
         edited_bytes = pdf_editor_engine.edit_pages(primary_data, ops_payload, extra_bytes)
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        for ep in extra_paths: safe_remove(ep)
+        raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:
+        safe_remove(spooled_path)
+        for ep in extra_paths: safe_remove(ep)
         raise HTTPException(status_code=400, detail=f"PDF page modification failed: {str(e)}")
+    finally:
+        safe_remove(spooled_path)
+        for ep in extra_paths: safe_remove(ep)
 
     base = sanitize_filename(os.path.splitext(file.filename)[0])
     return StreamingResponse(
@@ -1215,28 +1241,38 @@ async def pdf_color_effects_endpoint(
     x_himshiksha_key: Optional[str] = Header(None)
 ):
     verify_api_key(x_himshiksha_key)
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="PDF exceeds limit.")
-
-    preset_clean = (preset or "invert").lower().strip()
-    valid_presets = (
-        "invert", "negative", "grayscale", "black-white", "bw", "warm", "warm-tone",
-        "cool", "cool-tone", "classic-blue", "blue", "green", "green-tone", "natural-green",
-        "sepia", "high-contrast", "contrast", "original", "none"
-    )
-    if preset_clean not in valid_presets:
-        preset_clean = "invert"
-
+    # Stream/spool upload to disk without application fixed limit to support large multi-hundred MB PDFs
+    spooled_path = await spool_upload_to_disk(file, suffix="_color_effects.pdf")
     try:
+        file_size = os.path.getsize(spooled_path)
+        check_disk_space(file_size * 2)
+
+        with open(spooled_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        preset_clean = (preset or "invert").lower().strip()
+        valid_presets = (
+            "invert", "negative", "grayscale", "black-white", "bw", "warm", "warm-tone",
+            "cool", "cool-tone", "classic-blue", "blue", "green", "green-tone", "natural-green",
+            "sepia", "high-contrast", "contrast", "original", "none"
+        )
+        if preset_clean not in valid_presets:
+            preset_clean = "invert"
+
         filtered_bytes = pdf_color_engine.transform_pdf(
             pdf_bytes,
             preset=preset_clean,
             intensity=intensity,
             target_dpi=target_dpi
         )
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:
+        safe_remove(spooled_path)
         raise HTTPException(status_code=400, detail=f"PDF color effect processing failed: {str(e)}")
+    finally:
+        safe_remove(spooled_path)
 
     base = sanitize_filename(os.path.splitext(file.filename)[0])
     return StreamingResponse(
@@ -1547,11 +1583,15 @@ async def print_studio_endpoint(
     x_himshiksha_key: Optional[str] = Header(None)
 ):
     verify_api_key(x_himshiksha_key)
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="PDF exceeds file size limit.")
-
+    # Stream/spool upload to disk without application fixed limit to support large multi-hundred MB files
+    spooled_path = await spool_upload_to_disk(file, suffix="_print_studio.pdf")
     try:
+        file_size = os.path.getsize(spooled_path)
+        check_disk_space(file_size * 2)
+
+        with open(spooled_path, "rb") as f:
+            pdf_bytes = f.read()
+
         out_bytes = PrintStudioServerEngine.process_print_job(
             input_pdf_bytes=pdf_bytes,
             paper_size=paper_size,
@@ -1569,6 +1609,12 @@ async def print_studio_endpoint(
             media_type="application/pdf",
             headers={"Content-Disposition": 'attachment; filename="print_studio_output.pdf"'}
         )
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:
+        safe_remove(spooled_path)
         logger.error(f"Print Studio processing error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        safe_remove(spooled_path)
