@@ -37,6 +37,7 @@ from media_cleanup import spool_upload_to_disk, safe_remove, sweep_stale_temp_fi
 from audio_converter import convert_audio, AudioConversionError, AUDIO_CODEC_MAP
 from video_converter import convert_video, VideoConversionError, VIDEO_TARGET_SPECS
 import media_jobs
+import chunk_manager
 
 # ------------------------------------------------------------------------------
 # Configuration & Security Constants
@@ -1346,6 +1347,7 @@ async def convert_audio_endpoint(
     bitrate: Optional[str] = Form(None),
     sample_rate: Optional[int] = Form(None),
     channels: Optional[int] = Form(None),
+    async_mode: bool = Form(False),
     x_himshiksha_key: Optional[str] = Header(None)
 ):
     verify_api_key(x_himshiksha_key)
@@ -1355,7 +1357,34 @@ async def convert_audio_endpoint(
         file_size = os.path.getsize(spooled_path)
         check_size_limit("audio", file_size)
         check_disk_space(file_size * 2)
+    except (MediaLimitExceededError, MediaResourceError) as e:
+        safe_remove(spooled_path)
+        raise HTTPException(status_code=413, detail=str(e))
 
+    # Automatic switch to background job if file > 10MB or client requested async_mode
+    if async_mode or file_size > (10 * 1024 * 1024):
+        job_id = media_jobs.create_job(
+            media_type="audio",
+            input_path=spooled_path,
+            output_format=target_format,
+            original_filename=file.filename,
+            options={
+                "bitrate": bitrate,
+                "sample_rate": sample_rate,
+                "channels": channels
+            }
+        )
+        return {
+            "success": True,
+            "async": True,
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Audio conversion is processing in background.",
+            "status_url": f"/api/media/jobs/{job_id}",
+            "download_url": f"/api/media/jobs/{job_id}/download"
+        }
+
+    try:
         result = convert_audio(
             input_path=spooled_path,
             output_format=target_format,
@@ -1474,6 +1503,66 @@ async def convert_video_endpoint(
 # ------------------------------------------------------------------------------
 # 28. Media Job Status & Download Endpoints
 # ------------------------------------------------------------------------------
+@app.post("/api/media/upload/chunk-init")
+async def chunk_init_endpoint(
+    upload_id: str = Form(...),
+    filename: str = Form(...),
+    total_size: int = Form(...),
+    total_chunks: int = Form(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    try:
+        meta = chunk_manager.init_chunked_upload(upload_id, filename, total_size, total_chunks)
+        return {"success": True, "meta": meta}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/media/upload/chunk-append")
+async def chunk_append_endpoint(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    chunk_data: UploadFile = File(...),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    try:
+        content = await chunk_data.read()
+        meta = chunk_manager.append_chunk(upload_id, chunk_index, content)
+        return {"success": True, "meta": meta}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/media/upload/chunk-complete")
+async def chunk_complete_endpoint(
+    upload_id: str = Form(...),
+    media_type: str = Form("video"),
+    target_format: str = Form("mp4"),
+    options: Optional[str] = Form(None),
+    x_himshiksha_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_himshiksha_key)
+    import json
+    try:
+        assembled_path = chunk_manager.finalize_chunked_upload(upload_id)
+        parsed_opts = json.loads(options) if options else {}
+        job_id = media_jobs.create_job(
+            media_type=media_type,
+            input_path=assembled_path,
+            output_format=target_format,
+            original_filename=os.path.basename(assembled_path),
+            options=parsed_opts
+        )
+        return {
+            "success": True,
+            "async": True,
+            "job_id": job_id,
+            "status": "queued",
+            "status_url": f"/api/media/jobs/{job_id}",
+            "download_url": f"/api/media/jobs/{job_id}/download"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 @app.get("/api/media/jobs/{job_id}")
 async def get_media_job_status(job_id: str, x_himshiksha_key: Optional[str] = Header(None)):
     verify_api_key(x_himshiksha_key)
@@ -1481,6 +1570,12 @@ async def get_media_job_status(job_id: str, x_himshiksha_key: Optional[str] = He
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or expired.")
     return {"success": True, "job": job}
+
+@app.post("/api/media/jobs/{job_id}/cancel")
+async def cancel_media_job_endpoint(job_id: str, x_himshiksha_key: Optional[str] = Header(None)):
+    verify_api_key(x_himshiksha_key)
+    success = media_jobs.cancel_job(job_id)
+    return {"success": success, "message": "Job cancelled successfully" if success else "Could not cancel job"}
 
 @app.get("/api/media/jobs/{job_id}/download")
 async def download_media_job_output(job_id: str, x_himshiksha_key: Optional[str] = Header(None)):

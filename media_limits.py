@@ -13,8 +13,8 @@ CATEGORY_LIMITS = {
     "images": 20 * 1024 * 1024,        # 20 MB
     "pdf_docs": 20 * 1024 * 1024,      # 20 MB
     "office": 20 * 1024 * 1024,        # 20 MB
-    "audio": 50 * 1024 * 1024,         # 50 MB
-    "video": 800 * 1024 * 1024,        # 800 MB
+    "audio": 5368709120,               # 5 GB (5,368,709,120 bytes)
+    "video": 5368709120,               # 5 GB (5,368,709,120 bytes)
 }
 
 # Video Specific Processing Safety Bounds
