@@ -1,6 +1,6 @@
 """
 HimShiksha Python Engine - Main Application Entrypoint
-Modular FastAPI architecture connecting PDF, Image, Archive, Office, Media, Print Studio, and QR Studio engines.
+Modular FastAPI architecture connecting PDF, Image, Archive, Office, Media, Print Studio, QR Code Studio, and Bulk AI Studio engines.
 """
 
 import os
@@ -17,7 +17,8 @@ from routes import (
     office_router,
     media_router,
     print_studio_router,
-    qr_router
+    qr_router,
+    studio_router
 )
 
 # Configure logging
@@ -29,7 +30,7 @@ logger = logging.getLogger("himshiksha.api")
 
 app = FastAPI(
     title="HimShiksha Python Conversion API",
-    description="Modular high-performance backend supporting 2GB PDF/Image/Archive tools, 5GB Media Transcoding, and QR Code Studio.",
+    description="Modular high-performance backend supporting 2GB PDF/Image/Archive tools, 5GB Media Transcoding, QR Code Studio, and Bulk AI Studio Photo Enhancer.",
     version="2.0.0"
 )
 
@@ -51,6 +52,7 @@ app.include_router(office_router)
 app.include_router(media_router)
 app.include_router(print_studio_router)
 app.include_router(qr_router)
+app.include_router(studio_router)
 
 
 @app.exception_handler(Exception)
