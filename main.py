@@ -16,7 +16,8 @@ from routes import (
     archive_router,
     office_router,
     media_router,
-    print_studio_router
+    print_studio_router,
+    qr_router
 )
 
 # Configure logging
@@ -49,6 +50,7 @@ app.include_router(archive_router)
 app.include_router(office_router)
 app.include_router(media_router)
 app.include_router(print_studio_router)
+app.include_router(qr_router)
 
 
 @app.exception_handler(Exception)

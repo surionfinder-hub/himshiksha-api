@@ -6,6 +6,7 @@ from routes.archive_routes import router as archive_router
 from routes.office_routes import router as office_router
 from routes.media_routes import router as media_router
 from routes.print_studio_routes import router as print_studio_router
+from routes.qr_routes import router as qr_router
 
 __all__ = [
     "health_router",
@@ -14,5 +15,6 @@ __all__ = [
     "archive_router",
     "office_router",
     "media_router",
-    "print_studio_router"
+    "print_studio_router",
+    "qr_router"
 ]
