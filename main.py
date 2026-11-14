@@ -1,6 +1,6 @@
 """
 HimShiksha Python Engine - Main Application Entrypoint
-Modular FastAPI architecture connecting PDF, Image, Archive, Office, Media, and Print Studio engines.
+Modular FastAPI architecture connecting PDF, Image, Archive, Office, Media, Print Studio, and QR Studio engines.
 """
 
 import os
@@ -29,7 +29,7 @@ logger = logging.getLogger("himshiksha.api")
 
 app = FastAPI(
     title="HimShiksha Python Conversion API",
-    description="Modular high-performance backend supporting 2GB PDF/Image/Archive tools and 5GB Media Transcoding.",
+    description="Modular high-performance backend supporting 2GB PDF/Image/Archive tools, 5GB Media Transcoding, and QR Code Studio.",
     version="2.0.0"
 )
 
