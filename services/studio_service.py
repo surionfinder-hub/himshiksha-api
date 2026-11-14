@@ -13,12 +13,16 @@ import io
 import math
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageDraw
-import cv2
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 def remove_background(image: Image.Image) -> Image.Image:
     """
     Strips cluttered backgrounds. Uses rembg if installed;
-    otherwise executes OpenCV high-precision saliency & GrabCut foreground extraction.
+    otherwise executes OpenCV high-precision saliency & GrabCut foreground extraction,
+    with an ultra-fast pure PIL/NumPy background segmenter fallback.
     """
     image = image.convert("RGBA")
     
@@ -35,35 +39,46 @@ def remove_background(image: Image.Image) -> Image.Image:
         pass
 
     # 2. High-Precision Computer Vision / OpenCV GrabCut & Adaptive Saliency Fallback
+    if cv2 is not None:
+        try:
+            np_img = np.array(image)
+            bgr = cv2.cvtColor(np_img[:, :, :3], cv2.COLOR_RGB2BGR)
+            h, w = bgr.shape[:2]
+
+            mask = np.zeros((h, w), np.uint8)
+            bgd_model = np.zeros((1, 65), np.float64)
+            fgd_model = np.zeros((1, 65), np.float64)
+
+            margin_x = max(1, int(w * 0.04))
+            margin_y = max(1, int(h * 0.04))
+            rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+
+            cv2.grabCut(bgr, mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
+            final_mask = np.where((mask == 2) | (mask == 0), 0, 255).astype('uint8')
+            final_mask = cv2.GaussianBlur(final_mask, (7, 7), 0)
+            np_img[:, :, 3] = final_mask
+            return Image.fromarray(np_img, "RGBA")
+        except Exception:
+            pass
+
+    # 3. Pure Pillow & NumPy Fallback (Zero external C-library dependency, 100% crash-proof)
     np_img = np.array(image)
-    bgr = cv2.cvtColor(np_img[:, :, :3], cv2.COLOR_RGB2BGR)
-    h, w = bgr.shape[:2]
+    rgb = np_img[:, :, :3].astype(np.float32)
+    h, w = rgb.shape[:2]
 
-    # Initialize mask for GrabCut
-    mask = np.zeros((h, w), np.uint8)
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
+    # Sample corners to determine background color
+    corners = np.array([rgb[0, 0], rgb[0, -1], rgb[-1, 0], rgb[-1, -1]])
+    bg_color = np.median(corners, axis=0)
 
-    # Margin rectangle enclosing likely foreground subject
-    margin_x = max(1, int(w * 0.04))
-    margin_y = max(1, int(h * 0.04))
-    rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+    # Color difference distance
+    diff = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
+    threshold = 30.0
+    alpha = np.clip((diff - threshold) * 5.0, 0, 255).astype(np.uint8)
 
-    try:
-        cv2.grabCut(bgr, mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
-        final_mask = np.where((mask == 2) | (mask == 0), 0, 255).astype('uint8')
-        
-        # Soften alpha edges for realistic feathering
-        final_mask = cv2.GaussianBlur(final_mask, (7, 7), 0)
-    except Exception:
-        # Fallback to lightness/saliency thresholding
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, final_mask = cv2.threshold(blurred, 240, 255, cv2.THRESH_BINARY_INV)
-
-    # Composite into clean RGBA image
-    np_img[:, :, 3] = final_mask
-    return Image.fromarray(np_img, "RGBA")
+    # Smooth alpha mask
+    alpha_img = Image.fromarray(alpha, "L").filter(ImageFilter.GaussianBlur(3))
+    image.putalpha(alpha_img)
+    return image
 
 
 def auto_center_and_pad(image: Image.Image, margin_percent: float = 0.10) -> Image.Image:
