@@ -1,6 +1,6 @@
 """
 HimShiksha API - PDF Password Protection & Unlock Service
-Handles genuine AES-256 PDF encryption and authorized password decryption using disk-based PyMuPDF.
+Handles genuine AES-256 PDF encryption and authorized password decryption using PyMuPDF and pypdf.
 Supports files up to 2 GB with negligible RAM usage (<30 MB).
 """
 
@@ -31,6 +31,13 @@ def protect_pdf_file(input_pdf_path: str, password: str, confirm_password: str =
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid or corrupted PDF file: {str(e)}")
 
+    if doc.is_encrypted:
+        doc.close()
+        raise HTTPException(
+            status_code=400,
+            detail="This PDF document is already password-protected. Please use the PDF Unlock tool first to remove existing protection."
+        )
+
     if doc.page_count < 1:
         doc.close()
         raise HTTPException(status_code=400, detail="PDF has no pages to protect.")
@@ -39,6 +46,7 @@ def protect_pdf_file(input_pdf_path: str, password: str, confirm_password: str =
     # In PDF specification (ISO 32000), owner password must differ from user password
     owner_pw = f"{pw}_owner_{os.urandom(6).hex()}"
 
+    encryption_success = False
     try:
         doc.save(
             out_path,
@@ -47,13 +55,34 @@ def protect_pdf_file(input_pdf_path: str, password: str, confirm_password: str =
             owner_pw=owner_pw,
             permissions=pymupdf.PDF_PERM_ACCESSIBILITY | pymupdf.PDF_PERM_PRINT | pymupdf.PDF_PERM_COPY
         )
-    except Exception as e:
-        doc.close()
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        raise HTTPException(status_code=500, detail=f"Failed to apply AES-256 encryption: {str(e)}")
+        encryption_success = True
+    except Exception as py_err:
+        # Fallback to pypdf AES-256 encryption
+        try:
+            if not doc.is_closed:
+                doc.close()
+            import pypdf
+            reader = pypdf.PdfReader(input_pdf_path)
+            writer = pypdf.PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            writer.encrypt(user_password=pw, owner_password=owner_pw, algorithm="AES-256")
+            with open(out_path, "wb") as f_out:
+                writer.write(f_out)
+            encryption_success = True
+        except Exception as fallback_err:
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Failed to apply AES-256 encryption: {str(fallback_err)}")
     finally:
-        doc.close()
+        try:
+            if doc and not doc.is_closed:
+                doc.close()
+        except Exception:
+            pass
 
     # Integrity verification
     try:
@@ -102,21 +131,50 @@ def unlock_pdf_file(input_pdf_path: str, password: str) -> str:
     # Authenticate with provided password
     auth_code = doc.authenticate(pw)
     if auth_code <= 0:
-        doc.close()
-        raise HTTPException(status_code=400, detail="Incorrect password. Decryption failed. Please verify and enter the correct password.")
+        # Try with pypdf to be 100% certain
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(input_pdf_path)
+            res = reader.decrypt(pw)
+            if res == 0:
+                doc.close()
+                raise HTTPException(status_code=400, detail="Incorrect password. Decryption failed. Please verify and enter the correct password.")
+        except Exception as pypdf_err:
+            if isinstance(pypdf_err, HTTPException):
+                raise pypdf_err
+            doc.close()
+            raise HTTPException(status_code=400, detail="Incorrect password. Decryption failed. Please verify and enter the correct password.")
 
     out_path = create_temp_output_path(prefix="hs_unlocked_", suffix=".pdf")
 
     try:
         # Strip all encryption dictionaries
         doc.save(out_path, encryption=pymupdf.PDF_ENCRYPT_NONE)
-    except Exception as e:
-        doc.close()
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        raise HTTPException(status_code=500, detail=f"Failed to generate decrypted PDF: {str(e)}")
+    except Exception as py_err:
+        try:
+            if not doc.is_closed:
+                doc.close()
+            import pypdf
+            reader = pypdf.PdfReader(input_pdf_path)
+            reader.decrypt(pw)
+            writer = pypdf.PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            with open(out_path, "wb") as f_out:
+                writer.write(f_out)
+        except Exception as fallback_err:
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Failed to generate decrypted PDF: {str(fallback_err)}")
     finally:
-        doc.close()
+        try:
+            if doc and not doc.is_closed:
+                doc.close()
+        except Exception:
+            pass
 
     # Integrity verification
     try:
